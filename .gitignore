@@ -5,6 +5,7 @@
 /docs/build/
 /docs/Manifest.toml
 /test/Manifest.toml
+/ProtoConnect/Manifest.toml
 .DS_Store
 .claude
 Session.vim

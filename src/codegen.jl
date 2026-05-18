@@ -6,6 +6,8 @@ using ..ProtocGen.google.protobuf:
     DescriptorProto,
     EnumDescriptorProto,
     FileDescriptorProto,
+    MethodDescriptorProto,
+    ServiceDescriptorProto,
     var"FieldDescriptorProto.Label",
     var"FieldDescriptorProto.Type"
 
@@ -1909,18 +1911,20 @@ end
 # lines emitted at the top of the generated file.
 function _collect_cross_packages(file::FileDescriptorProto, names::LocalNames)
     pkgs = Set{String}()
+    function visit_typename(tn::AbstractString)
+        isempty(tn) && return
+        pkg = get(names.package_of, tn, "")
+        if !isempty(pkg) && pkg != names.package
+            push!(pkgs, pkg)
+        end
+    end
     function visit_msg(msg::DescriptorProto)
         # Map entry types are emitted inline as OrderedDict; their key/
         # value type refs need to flow through the same cross-package
         # check. We re-resolve via the FQN so map<K,V> with a V from
         # another package qualifies its V.
         for f in msg.field
-            tn = something(f.type_name, "")
-            isempty(tn) && continue
-            pkg = get(names.package_of, tn, "")
-            if !isempty(pkg) && pkg != names.package
-                push!(pkgs, pkg)
-            end
+            visit_typename(something(f.type_name, ""))
             # Map entry messages are children of `msg` but their fields'
             # type_names also need scanning. The recursive `nested_type`
             # walk below handles them.
@@ -1932,7 +1936,112 @@ function _collect_cross_packages(file::FileDescriptorProto, names::LocalNames)
     for msg in file.message_type
         visit_msg(msg)
     end
+    # Service RPC I/O types — same cross-package rules apply.
+    for svc in file.service
+        for m in svc.method
+            visit_typename(something(m.input_type, ""))
+            visit_typename(something(m.output_type, ""))
+        end
+    end
     return pkgs
+end
+
+# ----------------------------------------------------------------------------
+# Service emission. For each `service Foo { rpc Bar(In) returns (Out); }`,
+# emit:
+#
+#   1. `function Bar end` — a generic function the user adds server-side
+#      methods to (dispatched on their impl type) and that codegen adds a
+#      client-side method to (dispatched on AbstractRpcTransport). Same
+#      function, both roles.
+#   2. `MethodDescriptorProto(::typeof(Bar))` — the proto descriptor as
+#      the per-RPC metadata bundle. `method_name` / `request_type` /
+#      `response_type` / `rpc_mode` derive from it.
+#   3. `service_fqn(::typeof(Bar))` — the one bit not on
+#      MethodDescriptorProto (lives on ServiceDescriptorProto + file
+#      package). Single trait carries it.
+#   4. `Bar(t::AbstractRpcTransport, req::In)` — client stub that routes
+#      through `rpc_invoke`. No per-service `*Client` wrapper.
+#   5. `const Foo = (Bar, ...)` — tuple of RPC functions transports walk
+#      to mount the service.
+#
+# Streaming variants aren't wired into the client stub yet — they get a
+# placeholder comment and a TODO marker. The descriptor still carries
+# the right `client_streaming`/`server_streaming` bits, so transports
+# can introspect even before the client side ships.
+# ----------------------------------------------------------------------------
+function _emit_service(io::IO, svc::ServiceDescriptorProto, names::LocalNames)
+    svc_name = something(svc.name, "")
+    isempty(svc_name) && return
+    svc_fqn = isempty(names.package) ? svc_name : string(names.package, ".", svc_name)
+
+    println(io)
+    println(io, "# Service ", svc_fqn)
+
+    method_names = String[]
+    for m in svc.method
+        mname = something(m.name, "")
+        isempty(mname) && continue
+        push!(method_names, mname)
+        input_proto = something(m.input_type, "")
+        output_proto = something(m.output_type, "")
+        input_jl = _resolve_typename(input_proto, names)
+        output_jl = _resolve_typename(output_proto, names)
+        cs = something(m.client_streaming, false)
+        ss = something(m.server_streaming, false)
+        mode_comment =
+            cs && ss ? "bidi" :
+            cs ? "client-streaming" : ss ? "server-streaming" : "unary"
+
+        println(io)
+        println(io, "# ", mname, " — ", mode_comment)
+        println(io, "function ", mname, " end")
+        # Dispatch on the function's singleton type via `::typeof(f)` so
+        # callers pass the function value (`MethodDescriptorProto(SayHello)`),
+        # matching how the rest of the trait functions (`service_fqn`,
+        # `method_name`, …) consume RPCs.
+        println(io, "function PB.MethodDescriptorProto(::typeof(", mname, "))")
+        println(io, "    return PB.MethodDescriptorProto(;")
+        println(io, "        name = ", repr(mname), ",")
+        println(io, "        input_type = ", repr(input_proto), ",")
+        println(io, "        output_type = ", repr(output_proto), ",")
+        println(io, "        client_streaming = ", cs, ",")
+        println(io, "        server_streaming = ", ss, ",")
+        println(io, "    )")
+        println(io, "end")
+        println(
+            io,
+            "PB.service_fqn(::typeof(",
+            mname,
+            ")) = ",
+            repr(svc_fqn),
+        )
+        if !cs && !ss
+            println(
+                io,
+                "function ",
+                mname,
+                "(t::PB.AbstractRpcTransport, req::",
+                input_jl,
+                ")::",
+                output_jl,
+            )
+            println(io, "    return PB.rpc_invoke(t, ", mname, ", req)")
+            println(io, "end")
+        else
+            println(
+                io,
+                "# Client stub for ",
+                mode_comment,
+                " RPC not emitted yet — descriptor is still queryable. See #9.",
+            )
+        end
+    end
+
+    println(io)
+    # Always emit a trailing comma so a single-RPC service still produces a
+    # `Tuple` rather than the bare value (`(x,)` is a 1-tuple; `(x)` is `x`).
+    println(io, "const ", svc_name, " = (", join(method_names, ", "), ",)")
 end
 
 function codegen(file::FileDescriptorProto)
@@ -2039,6 +2148,17 @@ function codegen(
         _is_map_entry(msg) && continue
         push!(exports, something(msg.name, ""))
     end
+    # Services + their RPC functions — exporting both makes
+    # `using <module>` reach `Greeter` (the methods tuple) and each
+    # `SayHello` (the generic the user adds impls to).
+    for svc in file.service
+        sname = something(svc.name, "")
+        isempty(sname) || push!(exports, sname)
+        for m in svc.method
+            mname = something(m.name, "")
+            isempty(mname) || push!(exports, mname)
+        end
+    end
     if !isempty(exports)
         println(io, "export ", join(exports, ", "))
         println(io)
@@ -2140,6 +2260,11 @@ function codegen(
             println(io, "    return PB._decode_json_message(", jl, ", json; kw...)")
             println(io, "end")
         end
+    end
+
+    # Services come after all messages so RPC I/O types are already defined.
+    for svc in file.service
+        _emit_service(io, svc, cycle_names)
     end
 
     println(io)

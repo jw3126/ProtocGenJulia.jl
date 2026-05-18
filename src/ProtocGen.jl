@@ -124,11 +124,13 @@ include("plugin.jl")
 include("plugin_app.jl")
 include("wkt.jl")
 include("json_wkt.jl")
+include("rpc.jl")
 include("testing.jl")
 
 export encode, decode, encode_json, decode_json
 export OneOf, AbstractProtoBufMessage, DecodeError, OrderedDict
 export reserved_fields,
     extendable_field_numbers, oneof_field_types, field_numbers, json_field_names
+export AbstractRpcTransport, RpcError, StatusCode
 
 end # module
